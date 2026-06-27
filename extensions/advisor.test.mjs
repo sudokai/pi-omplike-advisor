@@ -163,6 +163,68 @@ test("formatTurnDelta: includes user, thinking, text, tool call + result", () =>
 	assert.match(md, /#### Tool result: `write`\n\nwrote a\.js/);
 });
 
+test("formatTurnDelta: edits render as compact header + result diff (no raw old/new blobs)", () => {
+	const diff = "  10 unchanged\n- 11 bootstrap 0/0\n+ 11 bootstrap 0.045% (9/20000)\n  12 unchanged";
+	const md = A.formatTurnDelta({
+		assistant: {
+			role: "assistant",
+			content: [
+				{
+					type: "toolCall",
+					id: "1",
+					name: "edit",
+					arguments: {
+						path: "RESULTS.md",
+						edits: [
+							{ oldText: "bootstrap 0/0", newText: "bootstrap 0.045% (9/20000)" },
+							{ oldText: "x", newText: "y" },
+						],
+					},
+				},
+			],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+		toolResults: [
+			{
+				role: "toolResult",
+				toolCallId: "1",
+				toolName: "edit",
+				content: [{ type: "text", text: "Successfully replaced 2 block(s)." }],
+				details: { diff },
+				isError: false,
+				timestamp: 2,
+			},
+		],
+	});
+	// compact toolCall header, not the raw {oldText,newText} JSON dump
+	assert.ok(md.includes("→ tool `edit`(RESULTS.md) — 2 block(s); diff in tool result"));
+	// the result body is the marked diff (with -/+ framing), not the success text
+	assert.ok(md.includes("- 11 bootstrap 0/0"));
+	assert.ok(md.includes("+ 11 bootstrap 0.045% (9/20000)"));
+	// the stale pre-edit blob must NOT appear as an unannotated peer (only inside the diff, prefixed)
+	assert.ok(!md.includes('"oldText"'));
+	assert.ok(!md.includes("Successfully replaced"));
+});
+
+test("formatTurnDelta: feeds large content verbatim (no truncation, no markers)", () => {
+	const big = "LINE\n".repeat(5000); // ~25KB, well past every old clamp
+	const md = A.formatTurnDelta({
+		userPrompt: big,
+		assistant: {
+			role: "assistant",
+			content: [{ type: "text", text: big }],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+		toolResults: [{ role: "toolResult", toolCallId: "1", toolName: "bash", content: [{ type: "text", text: big }], isError: false, timestamp: 2 }],
+	});
+	assert.ok(!md.includes("truncated"), "nothing should be truncated");
+	assert.ok(md.includes(big), "content rides verbatim");
+});
+
 test("formatTurnDelta: marks tool errors", () => {
 	const md = A.formatTurnDelta({
 		toolResults: [{ role: "toolResult", toolCallId: "1", toolName: "bash", content: [{ type: "text", text: "boom" }], isError: true, timestamp: 2 }],

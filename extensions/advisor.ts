@@ -268,9 +268,14 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
 
-function truncate(s: string, max = 4000): string {
-	return s.length <= max ? s : `${s.slice(0, max)}\n…[truncated ${s.length - max} chars]`;
-}
+// No truncation of the delta. The advisor is a peer reviewer (its own model, its
+// own read/grep/find), not a cheap/lightweight pass — nothing in the design says
+// otherwise. It must see what the main model saw, verbatim; clipping fields just
+// hid the part it needed to verify and bred false "didn't persist"/"garbled"
+// advice. (The advisor CAN re-read to verify — system prompt — but that's about
+// its actions, not a license to starve its input.) Cumulative context growth, if
+// it ever overflows, is the advisor agent's own compaction/reset concern (see
+// AdvisorRuntime.reset) — not something to pre-empt by mutilating entries on input.
 function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
@@ -282,31 +287,53 @@ export function formatTurnDelta(opts: {
 	toolResults?: ToolResultMessage[];
 }): string {
 	const parts: string[] = [];
-	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${truncate(opts.userPrompt.trim(), 6000)}`);
+	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${opts.userPrompt.trim()}`);
 
 	const a = opts.assistant;
 	if (a) {
 		const sub: string[] = [];
 		for (const c of a.content) {
 			if (c.type === "thinking" && c.thinking?.trim()) {
-				sub.push(`<thinking>\n${truncate(c.thinking.trim())}\n</thinking>`);
+				sub.push(`<thinking>\n${c.thinking.trim()}\n</thinking>`);
 			} else if (c.type === "text" && c.text?.trim()) {
-				sub.push(truncate(c.text.trim()));
+				sub.push(c.text.trim());
 			} else if (c.type === "toolCall") {
-				let args: string;
-				try {
-					args = JSON.stringify(c.arguments);
-				} catch {
-					args = "<unserializable>";
+				// Edits are rendered from the post-edit unified diff in their tool RESULT
+				// (below), NOT from the raw {oldText,newText} args. The args are two
+				// unannotated peer blobs: nothing marks which side is on disk. The advisor
+				// reviews AFTER the edit landed (a fresh read shows the NEW side), so peer
+				// blobs make it guess wrong ("didn't persist"). The diff's -/+ markers say
+				// which lines are current. Emit only a header here; the diff follows.
+				const edits = (c.arguments as { edits?: unknown[] } | undefined)?.edits;
+				if (Array.isArray(edits)) {
+					const p = (c.arguments as { path?: string }).path ?? "?";
+					sub.push(`→ tool \`${c.name}\`(${p}) — ${edits.length} block(s); diff in tool result`);
+				} else {
+					let args: string;
+					try {
+						args = JSON.stringify(c.arguments);
+					} catch {
+						args = "<unserializable>";
+					}
+					sub.push(`→ tool \`${c.name}\`(${args})`);
 				}
-				sub.push(`→ tool \`${c.name}\`(${truncate(args, 1200)})`);
 			}
 		}
 		if (sub.length) parts.push(`#### Assistant\n\n${sub.join("\n\n")}`);
 	}
 
 	for (const tr of opts.toolResults ?? []) {
-		const body = truncate(textOf(tr.content as Array<{ type: string; text?: string }>), 2500);
+		// Prefer the canonical line-numbered unified diff (the same view the human /
+		// main model gets, computed by pi's edit-diff) when the tool produced one: its
+		// -/+ markers unambiguously frame removed-vs-current lines, which the flat
+		// {oldText,newText} echo lacks. It is also a pinned point-in-time snapshot of
+		// THIS turn's change — the advisor's own read returns current (possibly later-
+		// edited) disk, so the inline diff is not re-derivable and must ride verbatim.
+		const diff = (tr as { details?: { diff?: unknown } }).details?.diff;
+		const body =
+			typeof diff === "string" && diff.trim()
+				? diff
+				: textOf(tr.content as Array<{ type: string; text?: string }>);
 		parts.push(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);
 	}
 	return parts.join("\n\n");
