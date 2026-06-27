@@ -6,7 +6,7 @@
   "author": "Petr Baudis",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pasky/pi-omplike-advisor.git"
+    "url": "git+https://github.com/pasky/pi-omplike-advisor.git"
   },
   "homepage": "https://github.com/pasky/pi-omplike-advisor#readme",
   "bugs": "https://github.com/pasky/pi-omplike-advisor/issues",
@@ -20,7 +20,8 @@
     "review"
   ],
   "files": [
-    "extensions/",
+    "extensions/advisor.ts",
+    "extensions/lib/",
     "README.md"
   ],
   "pi": {
