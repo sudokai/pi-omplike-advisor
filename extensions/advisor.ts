@@ -133,7 +133,7 @@ export async function runTurnBlock(opts: {
 	capMs?: number;
 	signal?: AbortSignal;
 	notify: (msg: string) => void;
-	deliverHeld: (notes: AdvisorNote[]) => void;
+	deliverHeld: (notes: AdvisorNote[], opts?: { terminal?: boolean }) => void;
 }): Promise<number> {
 	const { terminal, runtime } = opts;
 	const baseMs = opts.baseMs ?? 15_000;
@@ -153,7 +153,7 @@ export async function runTurnBlock(opts: {
 		// Only a successful reconfirmation settles; the advisor has pruned recanted
 		// notes, so #held is the confirmed survivor set.
 		const held = runtime.takeHeld();
-		if (held.length) opts.deliverHeld(held);
+		if (held.length) opts.deliverHeld(held, { terminal });
 		return 0;
 	}
 	// timeout OR failed (advisor errored 3x and dropped the reconfirm). Either way
@@ -161,7 +161,7 @@ export async function runTurnBlock(opts: {
 	if (terminal) {
 		const held = runtime.takeHeld();
 		if (held.length) {
-			opts.deliverHeld(held);
+			opts.deliverHeld(held, { terminal: true });
 			opts.notify("advisor didn't reconfirm in time; delivering held advice anyway");
 		}
 		return 0;
@@ -255,15 +255,22 @@ const escapeXml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, 
  * Render notes as the agent-facing message body: one `<advisory>` per note.
  * `stale` adds a `context` attribute noting the advice is about an earlier step
  * (used for nits, which the advisor always raises a little behind the agent).
+ * `finalAnswer` appends guidance for advice that arrives AFTER the agent had
+ * already returned a final answer this turn (a terminal/stop turn): if the agent
+ * acts on it, it should reply with a fresh, self-contained final answer rather
+ * than a terse follow-up — so the user reads one complete answer, not a
+ * back-and-forth thread it has to stitch together.
  */
-export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { stale?: boolean }): string {
+export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { stale?: boolean; finalAnswer?: boolean }): string {
 	const context = opts?.stale ? ` context="raised about an earlier step"` : "";
-	return notes
+	const body = notes
 		.map((n) => {
 			const sev = n.severity ? ` severity="${n.severity}"` : "";
 			return `<advisory${sev}${context} guidance="${ADVISOR_GUIDANCE}">\n${escapeXml(n.note)}\n</advisory>`;
 		})
 		.join("\n");
+	if (!opts?.finalAnswer) return body;
+	return `${body}\n\nYou had already returned a final answer to the user this turn. If you act on the advice above, respond with a new, self-contained final answer that fully stands on its own — do NOT write a terse follow-up that assumes the user read your previous message. The user should be able to read your new reply alone and get the complete answer.`;
 }
 
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
@@ -949,6 +956,13 @@ export default function (pi: ExtensionAPI) {
 	// the user just stopped. Cleared when the user drives the next turn.
 	let autoResumeSuppressed = false;
 
+	// Whether the turn currently being reviewed/blocked-on is terminal (the agent
+	// already returned a final answer). When true, advice we steer in will wake the
+	// stopped agent for a follow-up turn, so we tell it to reply with a fresh,
+	// self-contained final answer rather than a back-and-forth the user must stitch
+	// together. Updated every turn_end.
+	let currentTurnTerminal = false;
+
 	// ---- advice delivery into the primary session ----
 	// Called synchronously by the advise tool during a review. Returns true if the
 	// note was delivered now (recorded for dedup), false if held for reconfirmation
@@ -991,17 +1005,17 @@ export default function (pi: ExtensionAPI) {
 		// not auto-resume the run they stopped.
 		dbg("deliverAdvice nit", JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
-		const content = formatAdvisoryContent(notes, { stale: true });
+		const content = formatAdvisoryContent(notes, { stale: true, finalAnswer: currentTurnTerminal });
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 		return true;
 	}
 
 	// ---- steer held survivors into the primary (called by the catch-up block) ----
-	function deliverHeld(notes: AdvisorNote[]): void {
+	function deliverHeld(notes: AdvisorNote[], opts?: { terminal?: boolean }): void {
 		if (handoffInProgress() || !notes.length) return;
 		for (const n of notes) {
 			dbg("deliverHeld", n.severity, JSON.stringify(n.note).slice(0, 120));
-			const content = formatAdvisoryContent([n]);
+			const content = formatAdvisoryContent([n], { finalAnswer: !!opts?.terminal });
 			pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes: [n] } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 			// Record at the real delivery point (onAdvice→false never recorded it), so a
 			// later same-or-lower-severity repeat is deduped.
@@ -1018,6 +1032,7 @@ export default function (pi: ExtensionAPI) {
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
+		currentTurnTerminal = false;
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
@@ -1029,6 +1044,7 @@ export default function (pi: ExtensionAPI) {
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
+		currentTurnTerminal = false;
 	}
 
 	// ---- build the advisor agent lazily (needs ctx for model/registry/cwd) ----
@@ -1100,6 +1116,12 @@ export default function (pi: ExtensionAPI) {
 		dbg("turn_end", "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
 		if (!rt) return;
 
+		// Record terminality up front so advice delivered during THIS turn's review/
+		// catch-up block (nits via deliverAdvice, survivors via deliverHeld) can append
+		// the self-contained-final-answer guidance when it would wake a stopped agent.
+		const terminal = isTerminalTurn(event.message as any);
+		currentTurnTerminal = terminal;
+
 		const delta = formatTurnDelta({
 			userPrompt: pendingUserPrompt,
 			assistant: event.message as AssistantMessage,
@@ -1111,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
 		// Don't block during a handoff teardown (we'd stall the replacement).
 		if (handoffInProgress()) return;
 		consecutiveBlocks = await runTurnBlock({
-			terminal: isTerminalTurn(event.message as any),
+			terminal,
 			runtime: rt,
 			consecutiveBlocks,
 			baseMs: BLOCK_BASE_MS,

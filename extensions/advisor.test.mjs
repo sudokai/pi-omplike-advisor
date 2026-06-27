@@ -140,6 +140,15 @@ test("formatAdvisoryContent: stale option tags advice as about an earlier step",
 	assert.doesNotMatch(A.formatAdvisoryContent([{ note: "rename", severity: "nit" }]), /context=/);
 });
 
+test("formatAdvisoryContent: finalAnswer appends self-contained-final-answer guidance", () => {
+	const c = A.formatAdvisoryContent([{ note: "fix bug", severity: "blocker" }], { finalAnswer: true });
+	assert.match(c, /<\/advisory>/);
+	assert.match(c, /self-contained final answer/);
+	assert.match(c, /do NOT write a terse follow-up/);
+	// absent without the option
+	assert.doesNotMatch(A.formatAdvisoryContent([{ note: "fix bug", severity: "blocker" }]), /self-contained final answer/);
+});
+
 test("formatTurnDelta: includes user, thinking, text, tool call + result", () => {
 	const md = A.formatTurnDelta({
 		userPrompt: "do the thing",
