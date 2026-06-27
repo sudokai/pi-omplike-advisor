@@ -23,6 +23,25 @@ Advice is emitted at three severities, with different delivery semantics:
   next review (the advisor re-raises survivors and stays silent on resolved
   ones).
 
+## Context management (self-compaction)
+
+The advisor accumulates one turn-delta per primary turn in its own context. It
+**self-compacts** so long sessions keep getting reviewed instead of silently
+failing once its context fills:
+
+- **Proactive** — before each review, if the advisor's own context has crossed
+  `ADVISOR_COMPACT_AT`% of its window, it clears its message history and replays
+  the incoming turn fresh.
+- **Reactive** — if a review still overflows mid-stream (`stopReason "length"`),
+  it clears its history and replays that batch once into a fresh context. If a
+  *fresh* replay still overflows, the single batch genuinely doesn't fit and the
+  review is dropped as failed (no infinite retry).
+
+Held concern/blocker notes are **not** lost across a self-compaction: they live
+outside the agent transcript and ride the next review as the reconfirm preamble.
+This is independent of the primary's own compaction, which still triggers a full
+`reset()` of the advisor.
+
 While a high-severity note is held — or whenever a turn is about to idle — the
 primary's next step is stalled (a **catch-up block**) so the advisor can catch
 up. The wait backs off 15s → 30s → 60s … capped at 120s, is Escape-abortable,
@@ -92,6 +111,8 @@ for without touching the main agent's prompt.
 ## Environment variables
 
 - `ADVISOR_DEBUG=1` — verbose debug logging.
+- `ADVISOR_COMPACT_AT=80` — % of the advisor's context window at which it
+  proactively self-compacts (clamped to 50–95; default 80).
 - `ADVISOR_NO_REVIEW=1` — skip live model review (keeps the deterministic
   `/advisor test` delivery path). Used by the test harness.
 

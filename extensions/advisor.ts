@@ -275,16 +275,21 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 // advice. (The advisor CAN re-read to verify — system prompt — but that's about
 // its actions, not a license to starve its input.)
 //
-// Caveat: there is NO input-budget backpressure here, and the advisor does not
-// self-compact (AdvisorRuntime.reset is triggered by the PRIMARY's compaction, not
-// by the advisor's own context filling). On a very long/large session its
-// accumulated context can overflow; today that just fails the review (no crash).
-// Mostly fail-safe: a mid-run failed review goes silent. The one exception is a
-// TERMINAL turn, which by design delivers already-held high-severity notes
-// best-effort (last chance before idle, see runTurnBlock) — so an overflow there
-// could ship a stale held note. Proper input budgeting (chunking / advisor
-// self-reset on overflow) is a known follow-up; truncation was the wrong tool for
-// it — it corrupted every normal review to avert a rare case.
+// Input-budget policy (advisor self-compaction): the advisor's context is a pure
+// linear accumulation of INDEPENDENT turn deltas — no essential cross-turn state
+// lives in the agent's message history (held notes live in #held and ride the
+// reconfirm preamble, not the transcript). So when the advisor's own context
+// approaches the window it self-compacts: #drain clears ONLY the agent's message
+// history (#softReset) and replays the current batch into a fresh context. Two
+// triggers — PROACTIVE (before prompting, when usage crosses COMPACT_AT_PERCENT)
+// and REACTIVE (a review that still comes back stopReason=="length"). The reactive
+// path is loop-safe: if the agent was ALREADY fresh and still overflowed, the
+// single batch genuinely doesn't fit, so we stop self-compacting and fall through
+// to the normal failed-review handling instead of spinning. This replaces the old
+// behavior (overflow -> fail review -> retry 3x into the same wall -> give up,
+// possibly shipping a stale held note on a terminal turn). Note AdvisorRuntime.reset
+// is still separately triggered by the PRIMARY's compaction / history rewrites;
+// self-compaction is the advisor managing its OWN budget between those resets.
 function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
@@ -418,12 +423,38 @@ export class AdvisorRuntime {
 	#epoch = 0;
 	disposed = false;
 
+	// Self-compact when the advisor's own context reaches this % of its window
+	// (proactively, before the next review prompt). Below 100 so a fresh replay of
+	// the next batch comfortably fits; the reactive stopReason=="length" path is the
+	// backstop if a single batch crosses it anyway.
+	private readonly compactAtPercent: number;
+
 	constructor(
 		private readonly agent: Agent,
 		private readonly adviseTool: AdviseTool,
 		private readonly retryDelayMs = 1000,
 		private readonly onDebug?: (...a: unknown[]) => void,
-	) {}
+		compactAtPercent = 80,
+	) {
+		this.compactAtPercent = compactAtPercent;
+	}
+
+	/**
+	 * Self-compaction: clear ONLY the advisor agent's own message history,
+	 * preserving the pending queue, held notes, backlog, failure count, and settle
+	 * waiters. Safe because the agent transcript is a pure linear accumulation of
+	 * independent turn deltas — no essential cross-turn state lives there (held
+	 * notes ride the reconfirm preamble). Unlike reset(), this does NOT bump the
+	 * epoch (the in-flight review is ours, not orphaned) nor drop queued/held work.
+	 */
+	#softReset(): void {
+		try {
+			this.agent.abort();
+		} catch {}
+		try {
+			this.agent.reset();
+		} catch {}
+	}
 
 	get backlog(): number {
 		return this.#backlog;
@@ -622,18 +653,49 @@ export class AdvisorRuntime {
 				// loop records provider failures that way instead of throwing). A failed
 				// review must NOT prune held notes (we'd drop them as if recanted).
 				let failed = false;
+				// PROACTIVE self-compaction: if our own context has crossed the budget,
+				// clear the agent history now so this batch replays into a fresh context
+				// (held notes survive via the reconfirm preamble) instead of marching into
+				// an overflow. Skipped when already fresh (nothing to reclaim).
+				const pct = this.usage.contextPercent;
+				if (pct !== null && pct >= this.compactAtPercent && this.agent.state.messages.length > 0) {
+					this.onDebug?.("advisor self-compacting (proactive), ctx=", pct, "% >=", this.compactAtPercent, "%");
+					this.#softReset();
+				}
+				let stale = false;
 				try {
-					this.onDebug?.("prompting advisor agent, delta chars=", prompt.length, "held=", offered.length);
-					await this.agent.prompt(`### Session update\n\n${preamble}${prompt}`);
-					if (this.#epoch !== epoch) {
-						this.#reraised = undefined;
-						continue; // reset/dispose during the prompt; batch is stale
+					// Inner loop: at most ONE reactive self-compaction retry. If the
+					// advisor's own context overflows mid-review (stopReason "length"), clear
+					// its history and replay THIS batch into a fresh context instead of
+					// counting a failure and retrying 3x into the same wall. Loop-safe: a
+					// fresh replay that STILL overflows means the single batch genuinely
+					// doesn't fit, so it falls through to the failed handling below.
+					let last: AssistantMessage | undefined;
+					for (let attempt = 0; attempt < 2; attempt++) {
+						this.onDebug?.("prompting advisor agent, delta chars=", prompt.length, "held=", offered.length);
+						await this.agent.prompt(`### Session update\n\n${preamble}${prompt}`);
+						if (this.#epoch !== epoch) {
+							stale = true;
+							break; // reset/dispose during the prompt; batch is stale
+						}
+						last = this.agent.state.messages[this.agent.state.messages.length - 1] as AssistantMessage;
+						if (last?.stopReason === "length" && attempt === 0) {
+							this.onDebug?.("advisor context overflow, self-compacting (reactive) and replaying batch fresh");
+							this.#softReset();
+							this.#reraised = new Set();
+							continue;
+						}
+						break;
 					}
-					const last = this.agent.state.messages[this.agent.state.messages.length - 1] as AssistantMessage;
+					if (stale) {
+						this.#reraised = undefined;
+						continue;
+					}
 					if (last?.stopReason === "error" || last?.stopReason === "aborted" || last?.stopReason === "length") {
 						// error/aborted = provider failure (recorded, not thrown); length =
-						// truncated review — in all three the advisor didn't finish, so don't
-						// prune held notes on its accidental "silence".
+						// truncated review (a fresh replay still didn't fit) — in all three the
+						// advisor didn't finish, so don't prune held notes on its accidental
+						// "silence".
 						this.onDebug?.("advisor review incomplete, stop=", last?.stopReason, "err=", last?.errorMessage ?? "-");
 						failed = true;
 					} else {
@@ -977,7 +1039,10 @@ export default function (pi: ExtensionAPI) {
 			modelRegistry: ctx.modelRegistry,
 			adviseTool,
 		});
-		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg);
+		// ADVISOR_COMPACT_AT: % of the advisor's context window at which it self-
+		// compacts (clamped 50..95; default 80).
+		const compactAt = Math.min(95, Math.max(50, Number(process.env.ADVISOR_COMPACT_AT) || 80));
+		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg, compactAt);
 		activeModelLabel = `${model.provider}/${model.id}`;
 		builtForCwd = ctx.cwd;
 		dbg("built advisor runtime, model=", activeModelLabel);

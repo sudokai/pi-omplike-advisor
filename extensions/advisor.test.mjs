@@ -751,8 +751,14 @@ test("runtime.waitUntilSettled: reset() cancels a pending waiter as 'aborted' im
 	resolvePrompt?.(); // let the hung prompt unwind for a clean exit
 });
 
-test("runtime.waitUntilSettled: a truncated review (stopReason 'length') resolves 'failed', held preserved", async () => {
+test("runtime.waitUntilSettled: a batch that overflows even a FRESH context self-compacts once, then resolves 'failed', held preserved", async () => {
+	// stopReason "length" triggers a one-shot reactive self-compaction (clear the
+	// advisor's own history + replay the batch fresh). If the FRESH replay still
+	// overflows, the batch genuinely doesn't fit, so it counts as a failed review
+	// (retried up to 3x). Each outer review attempt therefore issues 2 prompts
+	// (initial + one fresh-replay) = 6 total across the 3 retries.
 	let attempts = 0;
+	let resets = 0;
 	const agent = {
 		state: { messages: [], model: {} },
 		async prompt() {
@@ -760,14 +766,48 @@ test("runtime.waitUntilSettled: a truncated review (stopReason 'length') resolve
 			this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "length" });
 		},
 		abort() {},
-		reset() {},
+		reset() {
+			resets++;
+			this.state.messages = [];
+		},
 	};
 	const rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0);
 	rt.hold("data race", "blocker");
 	rt.push("turn");
 	assert.equal(await rt.waitUntilSettled(2000), "failed");
-	assert.equal(attempts, 3, "truncated review retried 3x then dropped");
+	assert.equal(attempts, 6, "each of the 3 review retries self-compacts once then re-overflows (2 prompts each)");
+	assert.equal(resets, 3, "one reactive self-compaction per review retry");
 	assert.equal(rt.hasHeld, true, "held note NOT pruned by a truncated review");
+});
+
+test("runtime.waitUntilSettled: an ACCUMULATED-context overflow self-compacts and the fresh replay succeeds", async () => {
+	// The common case: the advisor's own accumulated transcript overflowed, but the
+	// batch fits fine in a fresh context. One reactive self-compaction recovers it —
+	// the review then succeeds (settled, not failed) and recanted holds are pruned.
+	let attempts = 0;
+	let resets = 0;
+	const agent = {
+		state: { messages: [{ role: "user", content: [] }, { role: "assistant", content: [] }], model: {} },
+		async prompt() {
+			attempts++;
+			// First attempt overflows (accumulated context); after a self-compaction the
+			// fresh replay (empty messages) succeeds.
+			const overflow = this.state.messages.length > 0;
+			this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: overflow ? "length" : "stop" });
+		},
+		abort() {},
+		reset() {
+			resets++;
+			this.state.messages = [];
+		},
+	};
+	const rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0);
+	rt.hold("data race", "blocker"); // offered as preamble; advisor stays silent → pruned on success
+	rt.push("turn");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+	assert.equal(attempts, 2, "overflow then one successful fresh replay");
+	assert.equal(resets, 1, "exactly one reactive self-compaction");
+	assert.equal(rt.hasHeld, false, "a successful (post-compaction) review still prunes recanted holds");
 });
 
 test("runtime.acceptingAdvice: an in-flight review orphaned by reset() stops accepting advice", async () => {
