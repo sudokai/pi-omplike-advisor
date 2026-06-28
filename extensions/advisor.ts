@@ -841,6 +841,10 @@ export class AdvisorRuntime {
 // ===========================================================================
 
 const ADVISORY_TYPE = "advisory";
+// Footer status key. Statuses are ordered alphabetically by key; "q-advisor"
+// sorts after "permissions"/"modes" but before "sub-bar", so Advisor shows as the
+// second segment. Change this to reposition it (e.g. "a-advisor" for leftmost).
+const STATUS_KEY = "q-advisor";
 const DEBUG = !!process.env.ADVISOR_DEBUG;
 const dbg = (...a: unknown[]) => {
 	if (DEBUG) console.error("[advisor]", ...a);
@@ -1025,15 +1029,24 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
-	// bar as `Advisor: $N`. Cleared when the advisor is off or torn down.
+	// bar as `│ Advisor: $N │`. Cleared when the advisor is off or torn down.
+	//
+	// Footer ordering: pi sorts extension statuses alphabetically BY KEY and joins
+	// them with a single space (no separators of its own). So the key controls
+	// position and we draw our own `│` dividers in the text. STATUS_KEY sorts after
+	// "permissions"/"modes" but before "sub-bar" (p < q < s), placing Advisor as the
+	// second segment rather than the leftmost.
 	function updateStatus(ctx: unknown): void {
-		const ui = (ctx as { ui?: { setStatus?: (k: string, t: string | undefined) => void } }).ui;
+		const ui = (ctx as {
+			ui?: { setStatus?: (k: string, t: string | undefined) => void; theme?: { fg: (c: string, s: string) => string } };
+		}).ui;
 		if (!ui?.setStatus) return;
 		if (!enabled || !runtime) {
-			ui.setStatus("advisor", undefined);
+			ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		ui.setStatus("advisor", `Advisor: $${runtime.usage.cost.toFixed(2)}`);
+		const bar = ui.theme ? ui.theme.fg("dim", "│") : "│";
+		ui.setStatus(STATUS_KEY, `${bar} Advisor: $${runtime.usage.cost.toFixed(2)} ${bar}`);
 	}
 
 	// ---- advice delivery into the primary session ----
@@ -1255,7 +1268,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		teardown();
-		(ctx as { ui?: { setStatus?: (k: string, t: string | undefined) => void } }).ui?.setStatus?.("advisor", undefined);
+		(ctx as { ui?: { setStatus?: (k: string, t: string | undefined) => void } }).ui?.setStatus?.(STATUS_KEY, undefined);
 	});
 
 	// ---- advisory card rendering ----
