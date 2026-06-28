@@ -1023,6 +1023,19 @@ export default function (pi: ExtensionAPI) {
 	// await, since late nit callbacks read it) and cleared at before_agent_start.
 	let currentTurnTerminal = false;
 
+	// ---- statusbar: minimalistic per-session advisor cost ----
+	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
+	// bar as `Advisor: $N`. Cleared when the advisor is off or torn down.
+	function updateStatus(ctx: unknown): void {
+		const ui = (ctx as { ui?: { setStatus?: (k: string, t: string | undefined) => void } }).ui;
+		if (!ui?.setStatus) return;
+		if (!enabled || !runtime) {
+			ui.setStatus("advisor", undefined);
+			return;
+		}
+		ui.setStatus("advisor", `Advisor: $${runtime.usage.cost.toFixed(2)}`);
+	}
+
 	// ---- advice delivery into the primary session ----
 	// Called synchronously by the advise tool during a review. Returns true if the
 	// note was delivered now (recorded for dedup), false if held for reconfirmation
@@ -1201,6 +1214,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Don't block during a handoff teardown (we'd stall the replacement).
 		if (handoffInProgress()) return;
+		updateStatus(ctx);
 		consecutiveBlocks = await runTurnBlock({
 			terminal,
 			runtime: rt,
@@ -1218,14 +1232,20 @@ export default function (pi: ExtensionAPI) {
 		// If the user aborted (Escape) around the block, suppress auto-resume so a late
 		// advisor callback from the still-running review can't restart the stopped run.
 		if ((ctx as any).signal?.aborted) autoResumeSuppressed = true;
+		// Refresh the footer cost after the advisor caught up (review cost is now in).
+		updateStatus(ctx);
 	});
 
 	// Re-prime the advisor when the primary transcript is rewritten.
-	pi.on("session_compact", () => runtime?.reset());
-	pi.on("session_start", (event) => {
+	pi.on("session_compact", (_event, ctx) => {
+		runtime?.reset();
+		updateStatus(ctx);
+	});
+	pi.on("session_start", (event, ctx) => {
 		// new/resume/fork replace history; a plain startup/reload keeps it.
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			resetAdvisorState();
+			updateStatus(ctx);
 		}
 	});
 
@@ -1233,7 +1253,10 @@ export default function (pi: ExtensionAPI) {
 	// (low-level sessionManager.newSession()), so reset off this explicit signal.
 	pi.events.on(HANDOFF_SESSION_REPLACED_CHANNEL, () => resetAdvisorState());
 
-	pi.on("session_shutdown", () => teardown());
+	pi.on("session_shutdown", (_event, ctx) => {
+		teardown();
+		(ctx as { ui?: { setStatus?: (k: string, t: string | undefined) => void } }).ui?.setStatus?.("advisor", undefined);
+	});
 
 	// ---- advisory card rendering ----
 	pi.registerMessageRenderer<{ notes: AdvisorNote[] }>(ADVISORY_TYPE, (message, _options, theme) => {
@@ -1258,6 +1281,7 @@ export default function (pi: ExtensionAPI) {
 				const state = enabled ? "enabled" : "disabled";
 				if (!enabled) {
 					ctx.ui.notify(`advisor ${state}`, "info");
+					updateStatus(ctx);
 					return;
 				}
 				const rt = await ensureRuntime(ctx as any);
@@ -1265,6 +1289,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`advisor enabled but no advisor model is available`, "warning");
 					return;
 				}
+				updateStatus(ctx);
 				const u = rt.usage;
 				const ctxStr = u.contextPercent !== null ? `${u.contextPercent}% (${u.contextTokens} tok)` : `${u.contextTokens} tok`;
 				ctx.ui.notify(
@@ -1279,6 +1304,7 @@ export default function (pi: ExtensionAPI) {
 				enabled = true;
 				saveEnabled(true);
 				const rt = await ensureRuntime(ctx as any);
+				updateStatus(ctx);
 				ctx.ui.notify(rt ? `advisor on — ${activeModelLabel}` : `advisor on, but no advisor model available`, rt ? "info" : "warning");
 				return;
 			}
@@ -1286,6 +1312,7 @@ export default function (pi: ExtensionAPI) {
 				enabled = false;
 				saveEnabled(false);
 				teardown();
+				updateStatus(ctx);
 				ctx.ui.notify("advisor off", "info");
 				return;
 			}
