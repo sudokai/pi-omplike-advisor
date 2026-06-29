@@ -156,12 +156,11 @@ export async function runTurnBlock(opts: {
 		const held = runtime.takeHeld();
 		if (held.length) opts.deliverHeld(held, { terminal });
 		// Replace the "catching up"/"waiting" notification in-place via the smart-update
-		// pattern in showStatus (last status text is overwritten). We know a notification
-		// was shown because the early return above guards this path.
-		// Signal the outcome: silence from the advisor means it reviewed and approves.
-		// When held survivors were delivered, advisory cards already appear in the chat
-		// — another status line would just be redundant noise, so we stay silent.
-		if (!held.length) opts.notify("advisor: looks good");
+		// pattern in showStatus. We know a notification was shown because the early
+		// return above guards this path. Advisory cards from deliverHeld are steered
+		// (queued, not rendered immediately), so the status line is all the user sees
+		// until the agent's next step — leaving stale "waiting" text would be confusing.
+		opts.notify(held.length ? "advisor: raised concerns" : "advisor: looks good");
 		return 0;
 	}
 	// timeout OR failed (advisor errored 3x and dropped the reconfirm). Either way
