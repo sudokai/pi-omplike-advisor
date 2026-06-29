@@ -1050,8 +1050,9 @@ export default function (pi: ExtensionAPI) {
 	// the user just stopped. Cleared when the user drives the next turn.
 	let autoResumeSuppressed = false;
 
-	// Track the primary's thinking level so we can skip the advisor when both model
-	// AND thinking are identical (same perspective, no value).
+	// Track the primary's thinking level for the same-model skip check in
+	// ensureRuntime(): when advisor model == chat model, skip unless the advisor's
+	// thinking is strictly deeper than the primary's.
 	let primaryThinkingLevel = DEFAULT_THINKING;
 
 	// Whether the primary is currently stopped, having returned a final answer (the
@@ -1193,14 +1194,9 @@ export default function (pi: ExtensionAPI) {
 		model: any;
 		currentThinkingLevel?: string;
 	}): Promise<AdvisorRuntime | undefined> {
-		if (runtime && builtForCwd === ctx.cwd) return runtime;
-		if (runtime && builtForCwd !== ctx.cwd) teardown();
-
 		if (!ctx.model) return undefined;
 
 		// Resolve advisor model: modes.json "advisor" first, else the hard default.
-		// Skip when the advisor brings no deeper perspective: same model with
-		// same-or-lower thinking level. A different model always runs.
 		let model: any;
 		let thinkingLevel = DEFAULT_THINKING;
 		try {
@@ -1214,11 +1210,24 @@ export default function (pi: ExtensionAPI) {
 			model = ctx.modelRegistry.find(DEFAULT_ADVISOR_PROVIDER, DEFAULT_ADVISOR_MODEL);
 		}
 		if (!model) return undefined;
-		if (model === ctx.model) {
-			const advisorRank = THINKING_RANK[thinkingLevel] ?? 0;
-			const primaryRank = THINKING_RANK[ctx.currentThinkingLevel ?? DEFAULT_THINKING] ?? 0;
-			if (advisorRank <= primaryRank) return undefined;
-		}
+		// Skip when the advisor brings no deeper perspective: same model with
+		// same-or-lower thinking level (a different model always runs). Re-evaluated
+		// every turn — not only at first build — so a mid-session change of the chat
+		// model or its thinking level that makes the advisor redundant actually
+		// suppresses it. The runtime cache must not keep a now-redundant advisor
+		// alive, so tear down when the cwd changed or the advisor is now suppressed;
+		// otherwise reuse the existing runtime to preserve its accumulated context
+		// across changes that don't flip the decision.
+		const sameModel = model === ctx.model;
+		const advisorRank = THINKING_RANK[thinkingLevel] ?? 0;
+		const primaryRank = THINKING_RANK[ctx.currentThinkingLevel ?? DEFAULT_THINKING] ?? 0;
+		const shouldSkip = sameModel && advisorRank <= primaryRank;
+
+		if (runtime && (builtForCwd !== ctx.cwd || shouldSkip)) teardown();
+
+		if (shouldSkip) return undefined;
+
+		if (runtime && builtForCwd === ctx.cwd) return runtime;
 
 		adviseTool = new AdviseTool(deliverAdvice);
 		const agent = buildAdvisorAgent({
@@ -1363,7 +1372,7 @@ export default function (pi: ExtensionAPI) {
 					updateStatus(ctx);
 					return;
 				}
-				const rt = await ensureRuntime(ctx as any);
+				const rt = await ensureRuntime({ ...(ctx as any), currentThinkingLevel: primaryThinkingLevel });
 				if (!rt) {
 					ctx.ui.notify(`advisor enabled but no advisor model is available`, "warning");
 					return;
@@ -1382,7 +1391,7 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "on") {
 				enabled = true;
 				saveEnabled(true);
-				const rt = await ensureRuntime(ctx as any);
+				const rt = await ensureRuntime({ ...(ctx as any), currentThinkingLevel: primaryThinkingLevel });
 				updateStatus(ctx);
 				ctx.ui.notify(rt ? `advisor on — ${activeModelLabel}` : `advisor on, but no advisor model available`, rt ? "info" : "warning");
 				return;
