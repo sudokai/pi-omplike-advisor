@@ -149,17 +149,29 @@ export async function runTurnBlock(opts: {
 	);
 
 	const result = await runtime.waitUntilSettled(timeoutMs, opts.signal);
-	if (result === "aborted") return opts.consecutiveBlocks; // user bailed; keep held + streak
+	// EVERY branch below must emit a closing notify. The opening status above
+	// ("catching up…"/"waiting…") is drawn by pi's showStatus(), which replaces the
+	// prior status line in-place only while statuses are emitted back-to-back with
+	// nothing else appended to the chat between them. Returning without a closer
+	// leaves the opening text stuck on screen — and a late nit from the advisor's
+	// still-draining review can then render its card below that stale text, which is
+	// the "catching up… + advisory card" impossibility users reported.
+	//
+	// (deliverHeld does NOT race this: during turn_end the primary is still
+	// streaming — isStreaming is true throughout, only cleared in finishRun()'s
+	// finally — so sendCustomMessage takes the agent.steer() branch, which just
+	// enqueues the card for the next turn. No synchronous render, no chatContainer
+	// mutation, so notify/deliverHeld order is irrelevant. The real bug was the
+	// missing closer on the branches below, not the ordering.)
+	if (result === "aborted") {
+		opts.notify("advisor: catch-up cancelled");
+		return opts.consecutiveBlocks; // user bailed; keep held + streak
+	}
 	if (result === "settled") {
 		// Only a successful reconfirmation settles; the advisor has pruned recanted
 		// notes, so #held is the confirmed survivor set.
 		const held = runtime.takeHeld();
 		if (held.length) opts.deliverHeld(held, { terminal });
-		// Replace the "catching up"/"waiting" notification in-place via the smart-update
-		// pattern in showStatus. We know a notification was shown because the early
-		// return above guards this path. Advisory cards from deliverHeld are steered
-		// (queued, not rendered immediately), so the status line is all the user sees
-		// until the agent's next step — leaving stale "waiting" text would be confusing.
 		opts.notify(held.length ? "advisor: raised concerns" : "advisor: looks good");
 		return 0;
 	}
@@ -167,13 +179,15 @@ export async function runTurnBlock(opts: {
 	// the held notes are NOT confirmed.
 	if (terminal) {
 		const held = runtime.takeHeld();
-		if (held.length) {
-			opts.deliverHeld(held, { terminal: true });
-			// Replaces the "catching up" text in-place, same as the settled path above.
-			opts.notify("advisor didn't reconfirm in time; delivering held advice anyway");
-		}
+		if (held.length) opts.deliverHeld(held, { terminal: true });
+		opts.notify(
+			held.length
+				? "advisor didn't reconfirm in time; delivering held advice anyway"
+				: "advisor: didn't finish in time; no concerns raised",
+		);
 		return 0;
 	}
+	opts.notify("advisor: didn't catch up; will retry next turn");
 	return opts.consecutiveBlocks + 1; // mid-run: keep held unconfirmed, lengthen next wait
 }
 

@@ -571,6 +571,60 @@ test("runTurnBlock: terminal + failed reconfirm → best-effort delivers", async
 	assert.deepEqual(delivered, [{ note: "x", severity: "concern" }], "last chance before idle → deliver best-effort");
 });
 
+// --- runTurnBlock status-close regressions ---
+// The opening "catching up…"/"waiting…" status must ALWAYS be replaced by a
+// closing notify, on every branch. pi's showStatus() updates the prior line
+// in-place only while statuses emit back-to-back; a missing closer leaves the
+// opening text stuck on screen (and a late nit card can then render below it).
+// These pin the three branches that used to return without notifying.
+const lastStatus = (notified) => notified[notified.length - 1];
+const STUCK_RE = /catching up before the turn ends|waiting up to \d+s to catch up/;
+
+test("runTurnBlock: terminal timeout with NOTHING held still closes the status (regression)", async () => {
+	// The primary stuck-message case: terminal turn, advisor didn't finish in time,
+	// and nothing was held — the old code skipped the notify entirely.
+	const notified = [];
+	const rt = stubRuntime({ held: [], settleResult: "timeout" });
+	const n = await A.runTurnBlock(blockArgs({ terminal: true, runtime: rt, notify: (m) => notified.push(m) }));
+	assert.equal(n, 0);
+	assert.ok(notified.length >= 2, "emits an opening AND a closing status");
+	assert.match(notified[0], /catching up before the turn ends/);
+	assert.ok(!STUCK_RE.test(lastStatus(notified)), "closing status replaces the stuck 'catching up' text");
+	assert.match(lastStatus(notified), /didn't finish in time/);
+});
+
+test("runTurnBlock: aborted closes the status (regression: no stuck 'catching up')", async () => {
+	const notified = [];
+	const rt = stubRuntime({ held: [{ note: "x", severity: "blocker" }], settleResult: "aborted" });
+	const n = await A.runTurnBlock(
+		blockArgs({ terminal: false, runtime: rt, consecutiveBlocks: 2, notify: (m) => notified.push(m) }),
+	);
+	assert.equal(n, 2, "streak preserved");
+	assert.ok(!STUCK_RE.test(lastStatus(notified)), "closing status replaces the stuck opening status");
+	assert.match(lastStatus(notified), /cancelled/);
+});
+
+test("runTurnBlock: mid-run timeout closes the status (regression: no stuck 'waiting')", async () => {
+	const notified = [];
+	const rt = stubRuntime({ held: [{ note: "x", severity: "blocker" }], settleResult: "timeout" });
+	const n = await A.runTurnBlock(
+		blockArgs({ terminal: false, runtime: rt, consecutiveBlocks: 1, notify: (m) => notified.push(m) }),
+	);
+	assert.equal(n, 2, "streak lengthens");
+	assert.ok(!STUCK_RE.test(lastStatus(notified)), "closing status replaces the stuck 'waiting' text");
+	assert.match(lastStatus(notified), /didn't catch up; will retry next turn/);
+});
+
+test("runTurnBlock: mid-run failed reconfirm closes the status (regression)", async () => {
+	const notified = [];
+	const rt = stubRuntime({ held: [{ note: "x", severity: "blocker" }], settleResult: "failed" });
+	const n = await A.runTurnBlock(
+		blockArgs({ terminal: false, runtime: rt, consecutiveBlocks: 0, notify: (m) => notified.push(m) }),
+	);
+	assert.equal(n, 1);
+	assert.ok(!STUCK_RE.test(lastStatus(notified)), "closing status replaces the stuck opening status");
+});
+
 // --- real AdvisorRuntime + stub Agent: hold → reconfirm → deliver/drop ---
 // onReview(text, {tool, rt, reviewCount}) simulates the advisor's reaction per review.
 function buildIntegration({ onReview } = {}) {
