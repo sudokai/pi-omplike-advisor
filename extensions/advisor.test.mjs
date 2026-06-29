@@ -1066,6 +1066,48 @@ test("runtime.hold: re-raising a held note at higher severity escalates it", () 
 	assert.equal(rt.takeHeld()[0].severity, "blocker");
 });
 
+test("runtime: cumulative stats survive dispose → new runtime (off→on toggle)", () => {
+	const stub = { state: { messages: [], model: {} }, async prompt() {}, abort() {}, reset() {} };
+	const rt1 = new A.AdvisorRuntime(stub, new A.AdviseTool(() => false), 0, undefined, 80, {
+		initialCumInput: 5000,
+		initialCumOutput: 800,
+		initialCumCost: 0.25,
+	});
+	const u1 = rt1.usage;
+	assert.equal(u1.input, 5000);
+	assert.equal(u1.output, 800);
+	assert.ok(Math.abs(u1.cost - 0.25) < 1e-9);
+
+	// dispose and build a new runtime seeded with the old usage
+	rt1.dispose();
+	const rt2 = new A.AdvisorRuntime(stub, new A.AdviseTool(() => false), 0, undefined, 80, {
+		initialCumInput: u1.input,
+		initialCumOutput: u1.output,
+		initialCumCost: u1.cost,
+	});
+	const u2 = rt2.usage;
+	assert.equal(u2.input, 5000, "input preserved across dispose→new");
+	assert.equal(u2.output, 800, "output preserved across dispose→new");
+	assert.ok(Math.abs(u2.cost - 0.25) < 1e-9, "cost preserved across dispose→new");
+	rt2.dispose();
+});
+
+test("runtime: reset() zeroes cumulative stats (session-boundary case)", () => {
+	const stub = { state: { messages: [], model: {} }, async prompt() {}, abort() {}, reset() {} };
+	const rt = new A.AdvisorRuntime(stub, new A.AdviseTool(() => false), 0, undefined, 80, {
+		initialCumInput: 5000,
+		initialCumOutput: 800,
+		initialCumCost: 0.25,
+	});
+	assert.equal(rt.usage.input, 5000, "pre-reset input");
+	rt.reset();
+	const u = rt.usage;
+	assert.equal(u.input, 0, "cum input zeroed by reset");
+	assert.equal(u.output, 0, "cum output zeroed by reset");
+	assert.equal(u.cost, 0, "cum cost zeroed by reset");
+	rt.dispose();
+});
+
 // ===========================================================================
 // 2. real loader
 // ===========================================================================

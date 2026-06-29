@@ -506,8 +506,14 @@ export class AdvisorRuntime {
 		private readonly retryDelayMs = 1000,
 		private readonly onDebug?: (...a: unknown[]) => void,
 		compactAtPercent = 80,
+		options?: { initialCumInput?: number; initialCumOutput?: number; initialCumCost?: number },
 	) {
 		this.compactAtPercent = compactAtPercent;
+		if (options) {
+			this.#cumInput = options.initialCumInput ?? 0;
+			this.#cumOutput = options.initialCumOutput ?? 0;
+			this.#cumCost = options.initialCumCost ?? 0;
+		}
 	}
 
 	/**
@@ -1042,6 +1048,12 @@ export default function (pi: ExtensionAPI) {
 	// await, since late nit callbacks read it) and cleared at before_agent_start.
 	let currentTurnTerminal = false;
 
+	// Cumulative stats preserved across /advisor off→on within the same session.
+	// Captured by teardown() before disposing the old runtime and restored when a
+	// new runtime is built in ensureRuntime(), so `/advisor status` always reflects
+	// the full session cost even after toggling the advisor off and back on.
+	let savedCumStats: { input: number; output: number; cost: number } | undefined;
+
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
 	// bar as `│ Advisor: $N`. Cleared when the advisor is off or torn down.
@@ -1129,6 +1141,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function teardown(): void {
+		// Preserve cumulative stats before disposing so a re-enable within the same
+		// session doesn't lose them (the new runtime picks them up via savedCumStats).
+		if (runtime) {
+			const u = runtime.usage;
+			savedCumStats = { input: u.input, output: u.output, cost: u.cost };
+		}
 		runtime?.dispose();
 		runtime = undefined;
 		adviseTool = undefined;
@@ -1147,6 +1165,7 @@ export default function (pi: ExtensionAPI) {
 	// paths can't drift.
 	function resetAdvisorState(): void {
 		runtime?.reset();
+		savedCumStats = undefined;
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
@@ -1199,7 +1218,8 @@ export default function (pi: ExtensionAPI) {
 		// ADVISOR_COMPACT_AT: % of the advisor's context window at which it self-
 		// compacts (clamped 50..95; default 80).
 		const compactAt = Math.min(95, Math.max(50, Number(process.env.ADVISOR_COMPACT_AT) || 80));
-		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg, compactAt);
+		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg, compactAt, savedCumStats);
+		savedCumStats = undefined; // consumed; next teardown re-captures
 		activeModelLabel = `${model.provider}/${model.id}`;
 		activeThinkingLevel = thinkingLevel;
 		builtForCwd = ctx.cwd;
@@ -1283,6 +1303,7 @@ export default function (pi: ExtensionAPI) {
 	// Re-prime the advisor when the primary transcript is rewritten.
 	pi.on("session_compact", (_event, ctx) => {
 		runtime?.reset();
+		savedCumStats = undefined;
 		updateStatus(ctx);
 	});
 	pi.on("session_start", (event, ctx) => {
