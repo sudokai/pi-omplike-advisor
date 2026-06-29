@@ -119,6 +119,7 @@ export interface TurnBlockRuntime {
  *     - mid-run  → timeout = backoff(consecutiveBlocks); on timeout, keep the held
  *                  notes and lengthen the next wait (return consecutiveBlocks+1).
  * - On settle: steer in whatever survived reconfirmation (may be empty), reset streak.
+ *   Clears the "catching up"/"waiting" notification it emitted (replaced with "caught up").
  * - On timeout / failed reconfirm (advisor errored out): non-terminal keeps the
  *   held notes and lengthens the next wait; terminal delivers best-effort (the
  *   agent did no follow-up — it stopped — so held notes are current, and it's the
@@ -154,6 +155,13 @@ export async function runTurnBlock(opts: {
 		// notes, so #held is the confirmed survivor set.
 		const held = runtime.takeHeld();
 		if (held.length) opts.deliverHeld(held, { terminal });
+		// Replace the "catching up"/"waiting" notification in-place via the smart-update
+		// pattern in showStatus (last status text is overwritten). We know a notification
+		// was shown because the early return above guards this path.
+		// Signal the outcome: silence from the advisor means it reviewed and approves.
+		// When held survivors were delivered, advisory cards already appear in the chat
+		// — another status line would just be redundant noise, so we stay silent.
+		if (!held.length) opts.notify("advisor: looks good");
 		return 0;
 	}
 	// timeout OR failed (advisor errored 3x and dropped the reconfirm). Either way
@@ -162,6 +170,7 @@ export async function runTurnBlock(opts: {
 		const held = runtime.takeHeld();
 		if (held.length) {
 			opts.deliverHeld(held, { terminal: true });
+			// Replaces the "catching up" text in-place, same as the settled path above.
 			opts.notify("advisor didn't reconfirm in time; delivering held advice anyway");
 		}
 		return 0;
@@ -1003,6 +1012,7 @@ export default function (pi: ExtensionAPI) {
 	// Lazily-built advisor state, rebuilt when cwd/model changes or session resets.
 	let runtime: AdvisorRuntime | undefined;
 	let activeModelLabel: string | undefined;
+	let activeThinkingLevel = DEFAULT_THINKING;
 	let builtForCwd: string | undefined;
 
 	// Delta accumulation across the lifecycle.
@@ -1124,6 +1134,7 @@ export default function (pi: ExtensionAPI) {
 		runtime = undefined;
 		adviseTool = undefined;
 		activeModelLabel = undefined;
+		activeThinkingLevel = DEFAULT_THINKING;
 		builtForCwd = undefined;
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
@@ -1191,6 +1202,7 @@ export default function (pi: ExtensionAPI) {
 		const compactAt = Math.min(95, Math.max(50, Number(process.env.ADVISOR_COMPACT_AT) || 80));
 		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg, compactAt);
 		activeModelLabel = `${model.provider}/${model.id}`;
+		activeThinkingLevel = thinkingLevel;
 		builtForCwd = ctx.cwd;
 		dbg("built advisor runtime, model=", activeModelLabel);
 		return runtime;
@@ -1326,7 +1338,7 @@ export default function (pi: ExtensionAPI) {
 				const u = rt.usage;
 				const ctxStr = u.contextPercent !== null ? `${u.contextPercent}% (${u.contextTokens} tok)` : `${u.contextTokens} tok`;
 				ctx.ui.notify(
-					`advisor ${state} — model ${activeModelLabel}, backlog ${rt.backlog}, ` +
+					`advisor ${state} — model ${activeModelLabel}, thinking ${activeThinkingLevel}, backlog ${rt.backlog}, ` +
 						`tokens ${u.input}in/${u.output}out, cost $${u.cost.toFixed(4)}, ctx ${ctxStr}`,
 					"info",
 				);
