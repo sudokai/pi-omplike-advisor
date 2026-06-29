@@ -872,6 +872,7 @@ const HANDOFF_SESSION_REPLACED_CHANNEL = "pi-amplike:handoff-session-replaced";
 const DEFAULT_ADVISOR_PROVIDER = "openrouter";
 const DEFAULT_ADVISOR_MODEL = "z-ai/glm-5.2";
 const DEFAULT_THINKING = "low";
+const THINKING_RANK: Record<string, number> = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5 };
 
 function agentDir(): string {
 	const env = process.env.PI_CODING_AGENT_DIR;
@@ -1020,6 +1021,10 @@ export default function (pi: ExtensionAPI) {
 	// the user just stopped. Cleared when the user drives the next turn.
 	let autoResumeSuppressed = false;
 
+	// Track the primary's thinking level so we can skip the advisor when both model
+	// AND thinking are identical (same perspective, no value).
+	let primaryThinkingLevel = DEFAULT_THINKING;
+
 	// Whether the primary is currently stopped, having returned a final answer (the
 	// most recent turn was terminal and the user hasn't driven a new one yet). When
 	// true, advice we steer in wakes the stopped agent for a follow-up turn, so we
@@ -1143,29 +1148,34 @@ export default function (pi: ExtensionAPI) {
 		cwd: string;
 		modelRegistry: any;
 		model: any;
+		currentThinkingLevel?: string;
 	}): Promise<AdvisorRuntime | undefined> {
 		if (runtime && builtForCwd === ctx.cwd) return runtime;
 		if (runtime && builtForCwd !== ctx.cwd) teardown();
 
 		if (!ctx.model) return undefined;
 
-		// Resolve advisor model: modes.json "advisor" first, else the default.
+		// Resolve advisor model: modes.json "advisor" first, else the hard default.
+		// Skip when the advisor brings no deeper perspective: same model with
+		// same-or-lower thinking level. A different model always runs.
 		let model: any;
 		let thinkingLevel = DEFAULT_THINKING;
 		try {
 			const resolved = await resolveModelAndThinking(ctx.cwd, ctx.modelRegistry, ctx.model, DEFAULT_THINKING, {
 				mode: "advisor",
 			});
-			// resolveModelAndThinking falls back to the current model when "advisor"
-			// mode is absent; detect that and use our hard default instead.
-			const sameAsPrimary = resolved.model === ctx.model;
-			model = sameAsPrimary ? undefined : resolved.model;
+			model = resolved.model;
 			thinkingLevel = resolved.thinkingLevel || DEFAULT_THINKING;
 		} catch {}
 		if (!model) {
 			model = ctx.modelRegistry.find(DEFAULT_ADVISOR_PROVIDER, DEFAULT_ADVISOR_MODEL);
 		}
 		if (!model) return undefined;
+		if (model === ctx.model) {
+			const advisorRank = THINKING_RANK[thinkingLevel] ?? 0;
+			const primaryRank = THINKING_RANK[ctx.currentThinkingLevel ?? DEFAULT_THINKING] ?? 0;
+			if (advisorRank <= primaryRank) return undefined;
+		}
 
 		adviseTool = new AdviseTool(deliverAdvice);
 		const agent = buildAdvisorAgent({
@@ -1187,6 +1197,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---- event wiring ----
+
+	// Track the primary's thinking level for the same-model-same-thinking skip check.
+	pi.on("thinking_level_select", (event) => {
+		primaryThinkingLevel = (event as any).level || DEFAULT_THINKING;
+	});
 
 	// Capture the user prompt so it rides the next turn delta to the advisor.
 	pi.on("before_agent_start", (event) => {
@@ -1218,7 +1233,7 @@ export default function (pi: ExtensionAPI) {
 		const terminal = isTerminalTurn(event.message as any);
 		currentTurnTerminal = terminal;
 
-		const rt = await ensureRuntime(ctx as any);
+		const rt = await ensureRuntime({ ...(ctx as any), currentThinkingLevel: primaryThinkingLevel });
 		dbg("turn_end", "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
 		if (!rt) return;
 
